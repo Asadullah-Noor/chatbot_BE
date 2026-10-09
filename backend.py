@@ -1,80 +1,54 @@
 import os
-
+import uuid
 from dotenv import load_dotenv
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
 from pydantic import BaseModel
-
 from langchain_groq import ChatGroq
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     AIMessage,
 )
-
 from langgraph.graph import (
     StateGraph,
     START,
     END,
 )
-
 from langgraph.graph.message import add_messages
-
 from langgraph.checkpoint.memory import InMemorySaver
-
 from typing import Annotated
 from typing_extensions import TypedDict
-
-
+from pathlib import Path
+from dotenv import load_dotenv
 # =========================================================
-# 1. LOAD ENVIRONMENT VARIABLES
+# 1. ENVIRONMENT
 # =========================================================
-
 load_dotenv()
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-print(
-    "KEY PREFIX:",
-    GROQ_API_KEY[:4]
-)
 if not GROQ_API_KEY:
     raise RuntimeError(
-        "GROQ_API_KEY is missing from .env file"
+        "GROQ_API_KEY is missing from .env"
     )
-
-print(
-    "API KEY LOADED:",
-    bool(GROQ_API_KEY)
-)
 # =========================================================
 # 2. LLM
 # =========================================================
-
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",
+    model="openai/gpt-oss-20b",
     api_key=GROQ_API_KEY,
     temperature=0,
 )
-
-
 # =========================================================
 # 3. LANGGRAPH STATE
 # =========================================================
-
 class ChatState(TypedDict):
-
     messages: Annotated[
         list[BaseMessage],
         add_messages
     ]
-
-
 # =========================================================
 # 4. CHATBOT NODE
 # =========================================================
-
 def chatbot(state: ChatState):
 
     print("\n========== CHATBOT NODE ==========")
@@ -91,25 +65,22 @@ def chatbot(state: ChatState):
 
 
 # =========================================================
-# 5. BUILD GRAPH
+# 5. BUILD LANGGRAPH
 # =========================================================
 
 builder = StateGraph(
     ChatState
 )
 
-
 builder.add_node(
     "chatbot",
     chatbot
 )
 
-
 builder.add_edge(
     START,
     "chatbot"
 )
-
 
 builder.add_edge(
     "chatbot",
@@ -134,11 +105,11 @@ graph = builder.compile(
 
 
 # =========================================================
-# 8. FASTAPI APP
+# 8. FASTAPI
 # =========================================================
 
 app = FastAPI(
-    title="LangGraph React Chatbot",
+    title="LangGraph Chatbot",
     version="1.0.0"
 )
 
@@ -157,18 +128,37 @@ app.add_middleware(
 
     allow_credentials=True,
 
-    allow_methods=[
-        "*"
-    ],
+    allow_methods=["*"],
 
-    allow_headers=[
-        "*"
-    ],
+    allow_headers=["*"],
 )
 
 
 # =========================================================
-# 10. REQUEST MODEL
+# 10. CONVERSATION METADATA
+# =========================================================
+
+"""
+This dictionary stores sidebar information.
+
+Example:
+
+{
+    "thread-id": {
+        "title": "What is LangGraph?",
+        "created_at": "...",
+        "updated_at": "..."
+    }
+}
+
+The actual messages are stored by LangGraph's checkpointer.
+"""
+
+conversations = {}
+
+
+# =========================================================
+# 11. REQUEST MODELS
 # =========================================================
 
 class ChatRequest(BaseModel):
@@ -178,19 +168,12 @@ class ChatRequest(BaseModel):
     thread_id: str
 
 
-# =========================================================
-# 11. CHAT RESPONSE MODEL
-# =========================================================
-
-class ChatResponse(BaseModel):
-
-    response: str
-
+class NewChatResponse(BaseModel):
     thread_id: str
 
 
 # =========================================================
-# 12. HOME / HEALTH CHECK
+# 12. HOME
 # =========================================================
 
 @app.get("/")
@@ -202,37 +185,116 @@ def home():
 
 
 # =========================================================
-# 13. CHAT ENDPOINT
+# 13. CREATE NEW CHAT
+# =========================================================
+
+@app.post("/new-chat",response_model=NewChatResponse)
+def new_chat():
+
+    thread_id = str(
+        uuid.uuid4()
+    )
+    conversations[thread_id] = {
+
+        "thread_id": thread_id,
+
+        "title": "New Chat",
+
+    }
+
+    return {
+        "thread_id": thread_id
+    }
+
+
+# =========================================================
+# 14. GET ALL CONVERSATIONS
+# =========================================================
+
+@app.get(
+    "/conversations"
+)
+def get_conversations():
+
+    return {
+        "conversations": list(conversations.values())
+    }
+
+
+# =========================================================
+# 15. CHAT
 # =========================================================
 
 @app.post(
-    "/chat",
-    response_model=ChatResponse
+    "/chat"
 )
-def chat(request: ChatRequest):
+def chat(
+    request: ChatRequest
+):
 
     try:
 
-        # -------------------------------------------------
-        # Thread configuration
-        # -------------------------------------------------
+        thread_id = request.thread_id
 
+        message = request.message.strip()
+
+        if not message:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Message cannot be empty"
+            )
+        # -------------------------------------------------
+        # Create metadata if thread doesn't exist
+        # -------------------------------------------------
+        if thread_id not in conversations:
+            conversations[thread_id] = {
+                "thread_id": thread_id,
+                "title": "New Chat",
+            }
+        # -------------------------------------------------
+        # Get previous conversation
+        # -------------------------------------------------
         config = {
             "configurable": {
-                "thread_id": request.thread_id
+                "thread_id": thread_id
             }
         }
-
-
+        # -------------------------------------------------
+        # Check whether this is first message
+        # -------------------------------------------------
+        try:
+            current_state = graph.get_state(
+                config
+            )
+            existing_messages = (
+                current_state.values.get(
+                    "messages",
+                    []
+                )
+            )
+        except Exception:
+            existing_messages = []
+        # -------------------------------------------------
+        # Generate title from first message
+        # -------------------------------------------------
+        if len(existing_messages) == 0:
+            title = message[:40]
+            if len(message) > 40:
+                title += "..."
+            conversations[
+                thread_id
+            ]["title"] = title
         # -------------------------------------------------
         # Invoke LangGraph
         # -------------------------------------------------
 
         result = graph.invoke(
+
             {
                 "messages": [
                     HumanMessage(
-                        content=request.message
+                        content=message
                     )
                 ]
             },
@@ -242,25 +304,38 @@ def chat(request: ChatRequest):
 
 
         # -------------------------------------------------
-        # Get last AI message
+        # Get AI response
         # -------------------------------------------------
 
-        last_message = result[
-            "messages"
-        ][-1]
+        messages = result["messages"]
+        ai_message = None
+        for message_item in reversed(messages):
+
+            if isinstance(
+                message_item,
+                AIMessage
+            ):
+
+                ai_message = message_item
+
+                break
 
 
-        # -------------------------------------------------
-        # Return response
-        # -------------------------------------------------
+        if ai_message is None:
+            raise Exception(
+                "AI response was not generated"
+            )
+        return {
+            "thread_id": thread_id,
+            "response": ai_message.content,
+            "title":
+                conversations[
+                    thread_id
+                ]["title"]
+        }
+    except HTTPException:
 
-        return ChatResponse(
-
-            response=last_message.content,
-
-            thread_id=request.thread_id
-
-        )
+        raise
 
 
     except Exception as error:
@@ -271,13 +346,16 @@ def chat(request: ChatRequest):
         )
 
         raise HTTPException(
+
             status_code=500,
+
             detail=str(error)
+
         )
 
 
 # =========================================================
-# 14. GET CHAT HISTORY
+# 16. GET ONE CONVERSATION HISTORY
 # =========================================================
 
 @app.get(
@@ -290,15 +368,15 @@ def get_history(
     try:
 
         config = {
+
             "configurable": {
+
                 "thread_id": thread_id
+
             }
+
         }
 
-
-        # -------------------------------------------------
-        # Get current state
-        # -------------------------------------------------
 
         state = graph.get_state(
             config
@@ -307,11 +385,6 @@ def get_history(
 
         messages = []
 
-
-        # -------------------------------------------------
-        # Convert LangChain messages
-        # into frontend-friendly JSON
-        # -------------------------------------------------
 
         for message in state.values.get(
             "messages",
@@ -323,7 +396,14 @@ def get_history(
                 HumanMessage
             ):
 
-                role = "user"
+                messages.append({
+
+                    "role": "user",
+
+                    "content":
+                        message.content
+
+                })
 
 
             elif isinstance(
@@ -331,26 +411,28 @@ def get_history(
                 AIMessage
             ):
 
-                role = "assistant"
+                messages.append({
 
+                    "role": "assistant",
 
-            else:
+                    "content":
+                        message.content
 
-                continue
-
-
-            messages.append({
-
-                "role": role,
-
-                "content": message.content
-
-            })
+                })
 
 
         return {
 
             "thread_id": thread_id,
+
+            "title":
+                conversations.get(
+                    thread_id,
+                    {}
+                ).get(
+                    "title",
+                    "Chat"
+                ),
 
             "messages": messages
 
@@ -365,13 +447,16 @@ def get_history(
         )
 
         raise HTTPException(
+
             status_code=500,
+
             detail=str(error)
+
         )
 
 
 # =========================================================
-# 15. GET CURRENT GRAPH STATE
+# 17. GET CURRENT LANGGRAPH STATE
 # =========================================================
 
 @app.get(
@@ -384,9 +469,13 @@ def get_state(
     try:
 
         config = {
+
             "configurable": {
+
                 "thread_id": thread_id
+
             }
+
         }
 
 
@@ -399,16 +488,18 @@ def get_state(
 
             "thread_id": thread_id,
 
-            "values": {
-                "messages": [
-                    message.content
-                    for message
-                    in state.values.get(
-                        "messages",
-                        []
-                    )
-                ]
-            },
+            "messages": [
+
+                message.content
+
+                for message
+
+                in state.values.get(
+                    "messages",
+                    []
+                )
+
+            ],
 
             "next": state.next,
 
@@ -424,19 +515,17 @@ def get_state(
 
     except Exception as error:
 
-        print(
-            "STATE ERROR:",
-            error
-        )
-
         raise HTTPException(
+
             status_code=500,
+
             detail=str(error)
+
         )
 
 
 # =========================================================
-# 16. CHECKPOINT HISTORY
+# 18. CHECKPOINT HISTORY
 # =========================================================
 
 @app.get(
@@ -449,16 +538,22 @@ def get_checkpoints(
     try:
 
         config = {
+
             "configurable": {
+
                 "thread_id": thread_id
+
             }
+
         }
 
 
         history = list(
+
             graph.get_state_history(
                 config
             )
+
         )
 
 
@@ -479,12 +574,16 @@ def get_checkpoints(
                 "values": {
 
                     "messages": [
+
                         message.content
+
                         for message
+
                         in state.values.get(
                             "messages",
                             []
                         )
+
                     ]
 
                 },
@@ -498,19 +597,18 @@ def get_checkpoints(
 
             "thread_id": thread_id,
 
-            "checkpoints": checkpoints
+            "checkpoints":
+                checkpoints
 
         }
 
 
     except Exception as error:
 
-        print(
-            "CHECKPOINT ERROR:",
-            error
-        )
-
         raise HTTPException(
+
             status_code=500,
+
             detail=str(error)
+
         )
